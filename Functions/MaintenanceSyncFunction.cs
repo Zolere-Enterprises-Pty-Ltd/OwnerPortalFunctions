@@ -72,7 +72,7 @@ public class MaintenanceSyncFunction(
 
         if (isNew)
         {
-            await SendOwnerEmailAsync(incident, ownerInfo, customerName, dynamicsUrl, dynamicsToken, cancellationToken);
+            await SendOwnerEmailAsync(incident, ownerInfo, customerName, connection, dynamicsUrl, dynamicsToken, cancellationToken);
         }
     }
 
@@ -133,7 +133,56 @@ public class MaintenanceSyncFunction(
         }
     }
 
-    private async Task SendOwnerEmailAsync(DynamicsCase incident, OwnerInfo ownerInfo, string propertyName, string dynamicsUrl, string dynamicsToken, CancellationToken cancellationToken)
+    /// <summary>
+    /// The mailbox owner approval mail is sent as. App setting <c>GraphMailSender</c>, defaulting to
+    /// <c>noreply@honeyhomes.com.au</c>.
+    ///
+    /// <para>
+    /// DEFAULTED, NOT REQUIRED, and that is a deliberate reversal. An earlier version of this threw when
+    /// the setting was absent, on the reasoning that guessing a sender is worse than not sending. That
+    /// reasoning holds only when nobody has said which mailbox to use — here the address is the
+    /// requirement, stated with the copy, so the default IS the specified value rather than a guess.
+    /// </para>
+    ///
+    /// <para>
+    /// And the setting is genuinely absent: <c>owner-portal-functions</c> has GraphClientId and
+    /// GraphClientSecret but no GraphMailSender (checked 2026-09-10). Throwing would have deployed a
+    /// function that sends nothing at all, logging an error per case, on a repo whose failure mode is
+    /// precisely "code shipped ahead of the manual step nobody ran". Setting the app setting is still
+    /// worth doing — it moves the sender without a deploy — but nothing breaks until someone does.
+    /// </para>
+    ///
+    /// <para>
+    /// SEPARATE FROM THE PORTAL WEB APP'S <c>GraphMail:Sender</c>, deliberately, even though both send
+    /// through the same Graph app registration. The web app's is <c>info@honeyhomes.com.au</c> and the
+    /// owner invite goes from it because that mail asks people to reply. This one is a no-reply
+    /// notification. Two app settings in two apps is what keeps the invite's sender from moving when this
+    /// one does.
+    /// </para>
+    /// </summary>
+    private const string DefaultGraphMailSender = "noreply@honeyhomes.com.au";
+
+    private static string GraphMailSender =>
+        Environment.GetEnvironmentVariable("GraphMailSender") is { } sender && !string.IsNullOrWhiteSpace(sender)
+            ? sender.Trim()
+            : DefaultGraphMailSender;
+
+    /// <summary>
+    /// The portal owners are sent to, from app setting <c>PortalBaseUrl</c>.
+    ///
+    /// <para>
+    /// DEFAULTED RATHER THAN REQUIRED, because the failure this guards against is a blank link in an
+    /// otherwise-correct email. The default is the live custom domain, which is also
+    /// <c>Portal:BaseUrl</c> in the portal repo's <c>appsettings.json</c> — so the two agree if the app
+    /// setting is never added, and the setting exists to move the URL without a deploy.
+    /// </para>
+    /// </summary>
+    private static string PortalBaseUrl =>
+        (Environment.GetEnvironmentVariable("PortalBaseUrl") is { } url && !string.IsNullOrWhiteSpace(url)
+            ? url.Trim()
+            : "https://portal.honeyhomes.com.au").TrimEnd('/');
+
+    private async Task SendOwnerEmailAsync(DynamicsCase incident, OwnerInfo ownerInfo, string propertyName, SqlConnection connection, string dynamicsUrl, string dynamicsToken, CancellationToken cancellationToken)
     {
         try
         {
@@ -157,10 +206,23 @@ public class MaintenanceSyncFunction(
             var graphToken = await GetGraphTokenAsync(tenantId, graphClientId, graphClientSecret, cancellationToken);
             logger.LogInformation("SendOwnerEmailAsync: Graph API token obtained successfully");
 
+            // Every interpolated value below has a stated substitute, because each of them is nullable in
+            // Dynamics and this is plain text with no layout to hide a gap. A missing value must read as a
+            // sentence an owner understands, never as a heading followed by nothing.
             var estimatedCostStr = incident.ExpectedCost.HasValue ? $"${incident.ExpectedCost:F2}" : "Not yet provided";
             var descriptionStr = string.IsNullOrWhiteSpace(incident.Description) ? "No description provided" : incident.Description;
-            var subject = $"Action Required: Maintenance approval needed for {propertyName}";
-            var body = $"A new maintenance request requires your approval.\n\nProperty: {propertyName}\nCase: {incident.CaseNumber} - {incident.Title}\nExpected Cost: {estimatedCostStr}\n\nMessage from our team:\n{incident.MessageToOwner}\n\nCase Description:\n{descriptionStr}\n\nIf you'd prefer to discuss this over the phone, please call us on (02) 5325 8561.\n\nPlease log in to your Owner Portal to approve or decline:\nhttps://honey-homes-owner-portal.azurewebsites.net";
+            var messageStr = string.IsNullOrWhiteSpace(incident.MessageToOwner) ? "No message provided" : incident.MessageToOwner;
+
+            // "Case: HH-1234 - Leaking tap", or just "Case: Leaking tap" when the ticket has no number.
+            // Printing the separator regardless would leave a line starting " - ".
+            var caseLine = string.IsNullOrWhiteSpace(incident.CaseNumber)
+                ? incident.Title
+                : $"{incident.CaseNumber} - {incident.Title}";
+
+            var phoneNumber = await RegionContact.ForListingAsync(connection, ownerInfo.PropertyId, logger, cancellationToken);
+
+            var subject = "Honey Homes: maintenance approval";
+            var body = $"A new maintenance request requires your approval.\n\nProperty: {propertyName}\nCase: {caseLine}\nExpected Cost: {estimatedCostStr}\n\nMessage from our team:\n{messageStr}\n\nCase Description:\n{descriptionStr}\n\nIf you'd prefer to discuss this over the phone, please call us on {phoneNumber}.\n\nPlease log in to your Owner Portal to approve or decline:\n{PortalBaseUrl}";
 
             var emailPayload = new
             {
@@ -176,9 +238,10 @@ public class MaintenanceSyncFunction(
             client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", graphToken);
 
             var json = JsonSerializer.Serialize(emailPayload);
-            logger.LogInformation("SendOwnerEmailAsync: sending email to {OwnerEmail} for case {IncidentId}", ownerEmail, incident.IncidentId);
+            var sender = GraphMailSender;
+            logger.LogInformation("SendOwnerEmailAsync: sending email from {Sender} to {OwnerEmail} for case {IncidentId}", sender, ownerEmail, incident.IncidentId);
             var response = await client.PostAsync(
-                "https://graph.microsoft.com/v1.0/users/clients@bnbmadeeasy.com.au/sendMail",
+                $"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(sender)}/sendMail",
                 new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
                 cancellationToken);
             logger.LogInformation("SendOwnerEmailAsync: email send response status {StatusCode} for case {IncidentId}", (int)response.StatusCode, incident.IncidentId);
