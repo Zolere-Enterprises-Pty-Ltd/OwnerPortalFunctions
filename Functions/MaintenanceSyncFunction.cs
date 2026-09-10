@@ -517,9 +517,6 @@ public class MaintenanceSyncFunction(
                 var timestampB = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById("AUS Eastern Standard Time")).ToString("yyyy-MM-dd HH:mm:ss AEST");
                 var notetextB = $"Owner decision received via Owner Portal.\n\nDecision: {approval.Status}\nComment: {approval.OwnerComments}\nTimestamp: {timestampB}";
                 await PostDynamicsAnnotationAsync(dynamicsUrl, token, "Owner Decision Received - Owner Portal", notetextB, approval.DynamicsCaseId, cancellationToken);
-
-                var propertyName = await GetPropertyNameAsync(connection, approval.PropertyId, cancellationToken);
-                await SendSlackNotificationAsync(approval, propertyName, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -527,47 +524,6 @@ public class MaintenanceSyncFunction(
                     "Unexpected error writing approval for MaintenanceRequest {Id} (Dynamics case {DynamicsCaseId})",
                     approval.Id, approval.DynamicsCaseId);
             }
-        }
-    }
-
-    private static async Task<string> GetPropertyNameAsync(SqlConnection connection, string propertyId, CancellationToken cancellationToken)
-    {
-        const string sql = "SELECT NickName FROM Listings WHERE GuestyId = @GuestyId";
-        await using var command = new SqlCommand(sql, connection);
-        command.Parameters.AddWithValue("@GuestyId", propertyId);
-        var result = await command.ExecuteScalarAsync(cancellationToken);
-        return result as string ?? propertyId;
-    }
-
-    private async Task SendSlackNotificationAsync(PendingApproval approval, string propertyName, CancellationToken cancellationToken)
-    {
-        var webhookUrl = Environment.GetEnvironmentVariable("OwnerPortalSlackWebhookUrl");
-        if (string.IsNullOrWhiteSpace(webhookUrl))
-        {
-            logger.LogWarning("OwnerPortalSlackWebhookUrl is not configured, skipping Slack notification.");
-            return;
-        }
-
-        try
-        {
-            var text = $"Owner has {approval.Status} a maintenance request.\n*Property:* {propertyName}\n*Case:* {approval.CaseNumber} - {approval.CaseTitle}\n*Decision:* {approval.Status}\n*Comment:* {approval.OwnerComments}";
-            var payload = JsonSerializer.Serialize(new { text });
-
-            var slackClient = httpClientFactory.CreateClient();
-            var response = await slackClient.PostAsync(
-                webhookUrl,
-                new StringContent(payload, System.Text.Encoding.UTF8, "application/json"),
-                cancellationToken);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                logger.LogError("Failed to send Slack notification for MaintenanceRequest {Id}: {Status} {Body}", approval.Id, (int)response.StatusCode, errorBody);
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Unexpected error sending Slack notification for MaintenanceRequest {Id}", approval.Id);
         }
     }
 
